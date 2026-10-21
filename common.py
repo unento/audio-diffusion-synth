@@ -38,6 +38,8 @@ class Config:
     n_fft: int = 1024
     hop_length: int = 256
     n_mels: int = 64
+    f_min: float = 0.0              # lowest mel filter edge (Hz)
+    f_max: float | None = None      # highest mel filter edge (Hz); None = Nyquist
     spec_frames: int = 128          # time axis of the spectrogram; sets the clip length
     db_range: float = 80.0          # dynamic range kept below the calibrated ceiling
 
@@ -163,12 +165,16 @@ def split_by_fold(data: dict, cfg: Config) -> tuple[dict, dict]:
     val = data["folds"] == cfg.val_fold
 
     def take(mask):
-        return {
+        out = {
             "waveforms": data["waveforms"][mask],
             "labels": data["labels"][mask],
             "folds": data["folds"][mask],
             "class_names": data["class_names"],
         }
+        for k in ("groups", "files"):                     # per-clip metadata, when the dataset has it
+            if k in data:
+                out[k] = [v for v, m in zip(data[k], mask.tolist()) if m]
+        return out
 
     return take(~held & ~val), take(val), take(held)
 
@@ -183,7 +189,7 @@ def valid_crop_starts(waveforms: torch.Tensor, cfg: Config) -> tuple[torch.Tenso
     L, hop = cfg.clip_samples, cfg.hop_length
     energies = []
     for i in range(0, len(waveforms), 256):
-        sq = waveforms[i : i + 256] ** 2
+        sq = waveforms[i : i + 256].float() ** 2
         energies.append(F.avg_pool1d(sq, kernel_size=L, stride=hop).squeeze(1))
     energy = torch.cat(energies)                                   # (N, n_starts)
     valid = energy >= cfg.crop_energy_frac * energy.max(dim=1, keepdim=True).values
@@ -210,7 +216,7 @@ class CropDataset(torch.utils.data.Dataset):
     def __getitem__(self, i: int):
         idx = self.valid_idx[i]
         s = int(self.starts[idx[torch.randint(len(idx), (1,))]])
-        return self.wave[i, :, s : s + self.L], self.labels[i]
+        return self.wave[i, :, s : s + self.L].float(), self.labels[i]
 
 
 def reference_crops(split: dict, cfg: Config, k: int = 2, return_clip_index: bool = False):
@@ -227,11 +233,180 @@ def reference_crops(split: dict, cfg: Config, k: int = 2, return_clip_index: boo
         idx = torch.nonzero(v).squeeze(1)
         pick = idx[torch.linspace(0, len(idx) - 1, k).round().long().unique()]
         for s in starts[pick].tolist():
-            crops.append(split["waveforms"][i, :, s : s + L])
+            crops.append(split["waveforms"][i, :, s : s + L].float())
             labels.append(split["labels"][i])
             clip_idx.append(i)
     out = (torch.stack(crops), torch.stack(labels))
     return out + (torch.tensor(clip_idx),) if return_clip_index else out
+
+
+class BalancedDataset(torch.utils.data.Dataset):
+    """Wraps a dataset so every class is drawn equally often, whatever its size.
+
+    Each access ignores the index it is given: it picks a class uniformly at
+    random, then a random clip of that class from the wrapped dataset (which
+    still applies its own random crop). The length stays that of the wrapped
+    dataset, so an "epoch" covers the same number of draws.
+    """
+
+    def __init__(self, base, labels: torch.Tensor):
+        self.base = base
+        self.by_class = [torch.nonzero(labels == c).squeeze(1) for c in torch.unique(labels)]
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, _):
+        idx = self.by_class[int(torch.randint(len(self.by_class), (1,)))]
+        return self.base[int(idx[torch.randint(len(idx), (1,))])]
+
+
+# ----------------------------------------------------------------------------
+# 2b. Ocean sounds dataset (grouper / vessel; 10 kHz, 2 s clips)
+# ----------------------------------------------------------------------------
+OCEAN_CLASSES = {"2": "Nassau grouper", "3": "Yellowfin grouper", "4": "Black grouper",
+                 "6": "Squirrelfish", "7": "Vessel", "8": "Toadfish"}
+
+
+def ocean_config(**overrides) -> Config:
+    """Config for the ocean dataset: 10 kHz, 128 mel bands from 20 Hz to Nyquist.
+
+    hop 156 with 128 frames gives clips of 19,812 samples (1.98 s), so a crop
+    fits inside each 2 s file with a little room for random offset, and the
+    spectrogram is 128 x 128 like Path A at 128 bands.
+    """
+    base = dict(sample_rate=10000, n_fft=1024, hop_length=156, n_mels=128, spec_frames=128,
+                f_min=20.0, num_classes=len(OCEAN_CLASSES))
+    base.update(overrides)
+    return Config(**base)
+
+
+def _highpass(x: np.ndarray, rate: int, hz: float) -> np.ndarray:
+    """Zero every FFT bin below `hz`, which also removes the DC offset."""
+    X = np.fft.rfft(x)
+    X[: int(np.ceil(hz * len(x) / rate))] = 0
+    return np.fft.irfft(X, n=len(x)).astype(np.float32)
+
+
+def load_ocean(cfg: Config, source: str, group_size: int = 20, highpass_hz: float = 20.0,
+               normalize: str = "rms", target_rms: float = 0.05, seed: int = 0) -> dict:
+    """Load the ocean dataset into the same dict format as load_esc50.
+
+    source       a folder with one sub-folder per class code, or a .zip of it.
+                 A zip is extracted once to local disk (/content/ocean_raw),
+                 which is far faster to read than thousands of files on Drive.
+    Steps, each reported in data["report"]:
+      1. Read every clip (int16, mono, cfg.sample_rate).
+      2. Exact duplicates: within a class, keep one copy; a clip found under
+         two different classes is dropped entirely, since its label is ambiguous.
+      3. Provisional recording groups. The filenames carry no recording or
+         site IDs, so consecutive file numbers within a class are grouped in
+         blocks of `group_size` (block = number // group_size); a file without
+         a number is its own group. Consecutive windows of one recording then
+         stay together. Replace with real source IDs once available.
+      4. Folds 1-5: groups are shuffled per class and dealt to folds in turn,
+         so each fold holds ~20% of every class and no group is split.
+         With the default Config, folds 1-3 train, 4 validates, 5 is held out.
+      5. High-pass at `highpass_hz` (removes DC and sub-sonic drift), then
+         per-clip normalization: "rms" scales every clip to `target_rms`
+         (removes level differences that may come from equipment, not the
+         sound), "none" keeps raw levels.
+    Waveforms are stored as float16 to halve memory (~2 GB for 50k clips).
+    The result is cached next to cfg.data_root, keyed by the options.
+    """
+    import re
+    import zipfile
+    import soundfile as sf
+    import hashlib
+
+    key = f"ocean_g{group_size}_hp{highpass_hz:g}_{normalize}{target_rms:g}_s{seed}"
+    cache = Path(cfg.data_root) / f"{key}.pt"
+    if cache.exists():
+        return torch.load(cache)
+
+    root = Path(source)
+    if root.suffix.lower() == ".zip":
+        dest = Path("/content/ocean_raw") if Path("/content").exists() else Path(cfg.data_root) / "ocean_raw"
+        if not dest.exists():
+            print(f"extracting {root.name} to {dest} ...")
+            with zipfile.ZipFile(root) as z:
+                z.extractall(dest)
+        root = dest
+    class_dirs = {}
+    for d in root.rglob("*"):
+        if d.is_dir() and d.name in OCEAN_CLASSES and any(d.glob("*.wav")):
+            class_dirs[d.name] = d
+    codes = sorted(class_dirs)
+    assert codes, f"no class folders {sorted(OCEAN_CLASSES)} with .wav files found under {root}"
+
+    clip_len = None
+    waves, labels, names, groups, hashes = [], [], [], [], {}
+    for li, code in enumerate(codes):
+        files = sorted(class_dirs[code].glob("*.wav"))
+        for p in files:
+            x, r = sf.read(p, dtype="int16", always_2d=True)
+            assert r == cfg.sample_rate, f"{p}: {r} Hz, expected {cfg.sample_rate}"
+            x = x[:, 0]
+            clip_len = clip_len or len(x)
+            if len(x) != clip_len:
+                continue
+            h = hashlib.md5(x.tobytes()).hexdigest()
+            hashes.setdefault(h, []).append(len(waves))
+            nums = re.findall(r"\d+", p.stem)
+            groups.append(f"{code}:{int(nums[-1]) // group_size}" if nums else f"{code}:{p.stem}")
+            waves.append(x); labels.append(li); names.append(f"{code}/{p.name}")
+        print(f"read {code} ({OCEAN_CLASSES[code]}): {len(files)} files")
+    labels_np = np.array(labels)
+
+    keep = np.ones(len(waves), dtype=bool)
+    n_within = n_cross = 0
+    for idx in hashes.values():
+        if len(idx) < 2:
+            continue
+        if len(set(labels_np[idx])) > 1:
+            keep[idx] = False; n_cross += 1
+        else:
+            keep[idx[1:]] = False; n_within += len(idx) - 1
+
+    kept = np.flatnonzero(keep)
+    rng = np.random.default_rng(seed)
+    folds = np.zeros(len(waves), dtype=np.int64)
+    group_arr = np.array(groups)
+    for li in range(len(codes)):
+        cls_groups = np.unique(group_arr[kept][labels_np[kept] == li])
+        rng.shuffle(cls_groups)
+        # deal groups to folds, always to the fold that currently holds the fewest clips of this class
+        sizes = np.zeros(5)
+        gcount = {g: n for g, n in zip(*np.unique(group_arr[kept][labels_np[kept] == li], return_counts=True))}
+        for g in cls_groups:
+            f = int(np.argmin(sizes)); sizes[f] += gcount[g]
+            folds[(group_arr == g) & keep] = f + 1
+
+    out = np.zeros((len(kept), 1, clip_len), dtype=np.float16)
+    for j, i in enumerate(kept):
+        x = waves[i].astype(np.float32) / 32768.0
+        if highpass_hz > 0:
+            x = _highpass(x, cfg.sample_rate, highpass_hz)
+        if normalize == "rms":
+            x = x * (target_rms / max(float(np.sqrt(np.mean(x ** 2))), 1e-8))
+        out[j, 0] = x
+
+    report = {"files_read": len(waves), "duplicates_removed_within_class": n_within,
+              "cross_class_duplicate_groups_dropped": n_cross, "clips_kept": len(kept),
+              "group_size": group_size, "highpass_hz": highpass_hz, "normalize": normalize}
+    data = {
+        "waveforms": torch.from_numpy(out),
+        "labels": torch.from_numpy(labels_np[kept]),
+        "folds": torch.from_numpy(folds[kept]),
+        "groups": [groups[i] for i in kept],
+        "files": [names[i] for i in kept],
+        "class_names": [OCEAN_CLASSES[c] for c in codes],
+        "class_codes": codes,
+        "report": report,
+    }
+    Path(cfg.data_root).mkdir(parents=True, exist_ok=True)
+    torch.save(data, cache)
+    return data
 
 
 # ----------------------------------------------------------------------------
@@ -250,7 +425,7 @@ class MelFrontEnd:
         self.cfg, self.db_max, self.device = cfg, db_max, device
         self.mel = torchaudio.transforms.MelSpectrogram(
             sample_rate=cfg.sample_rate, n_fft=cfg.n_fft, hop_length=cfg.hop_length,
-            n_mels=cfg.n_mels, power=2.0,
+            n_mels=cfg.n_mels, f_min=cfg.f_min, f_max=cfg.f_max, power=2.0,
         ).to(device)
 
     def raw_db(self, wave: torch.Tensor) -> torch.Tensor:
