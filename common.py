@@ -302,7 +302,8 @@ def load_ocean(cfg: Config, source: str, group_size: int = 20, highpass_hz: floa
       3. Provisional recording groups. The filenames carry no recording or
          site IDs, so consecutive file numbers within a class are grouped in
          blocks of `group_size` (block = number // group_size); a file without
-         a number is its own group. Consecutive windows of one recording then
+         a number is its own group; toadfish files named "N_seg_M" are grouped by
+         their source file N. Consecutive windows of one recording then
          stay together. Replace with real source IDs once available.
       4. Folds 1-5: groups are shuffled per class and dealt to folds in turn,
          so each fold holds ~20% of every class and no group is split.
@@ -319,7 +320,7 @@ def load_ocean(cfg: Config, source: str, group_size: int = 20, highpass_hz: floa
     import soundfile as sf
     import hashlib
 
-    key = f"ocean_g{group_size}_hp{highpass_hz:g}_{normalize}{target_rms:g}_s{seed}"
+    key = f"ocean_v2_g{group_size}_hp{highpass_hz:g}_{normalize}{target_rms:g}_s{seed}"
     cache = Path(cfg.data_root) / f"{key}.pt"
     if cache.exists():
         return torch.load(cache)
@@ -352,8 +353,12 @@ def load_ocean(cfg: Config, source: str, group_size: int = 20, highpass_hz: floa
                 continue
             h = hashlib.md5(x.tobytes()).hexdigest()
             hashes.setdefault(h, []).append(len(waves))
+            seg = re.fullmatch(r"(\d+)_seg_\d+", p.stem)        # toadfish "N_seg_M": segment M of source file N
             nums = re.findall(r"\d+", p.stem)
-            groups.append(f"{code}:{int(nums[-1]) // group_size}" if nums else f"{code}:{p.stem}")
+            if seg:
+                groups.append(f"{code}:src{seg.group(1)}")      # all segments of one source stay together
+            else:
+                groups.append(f"{code}:{int(nums[-1]) // group_size}" if nums else f"{code}:{p.stem}")
             waves.append(x); labels.append(li); names.append(f"{code}/{p.name}")
         print(f"read {code} ({OCEAN_CLASSES[code]}): {len(files)} files")
     labels_np = np.array(labels)
@@ -367,6 +372,15 @@ def load_ocean(cfg: Config, source: str, group_size: int = 20, highpass_hz: floa
             keep[idx] = False; n_cross += 1
         else:
             keep[idx[1:]] = False; n_within += len(idx) - 1
+
+    # Silent clips: nothing left after the high-pass. RMS normalization would turn them into amplified noise.
+    n_silent = 0
+    for i in np.flatnonzero(keep):
+        x = waves[i].astype(np.float32) / 32768.0
+        if highpass_hz > 0:
+            x = _highpass(x, cfg.sample_rate, highpass_hz)
+        if np.sqrt(np.mean(x ** 2)) < 10 ** (-100 / 20):         # below -100 dBFS
+            keep[i] = False; n_silent += 1
 
     kept = np.flatnonzero(keep)
     rng = np.random.default_rng(seed)
@@ -392,7 +406,7 @@ def load_ocean(cfg: Config, source: str, group_size: int = 20, highpass_hz: floa
         out[j, 0] = x
 
     report = {"files_read": len(waves), "duplicates_removed_within_class": n_within,
-              "cross_class_duplicate_groups_dropped": n_cross, "clips_kept": len(kept),
+              "cross_class_duplicate_groups_dropped": n_cross, "silent_clips_dropped": n_silent, "clips_kept": len(kept),
               "group_size": group_size, "highpass_hz": highpass_hz, "normalize": normalize}
     data = {
         "waveforms": torch.from_numpy(out),
