@@ -17,7 +17,7 @@ import os
 import random
 import urllib.request
 import zipfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 import numpy as np
@@ -470,11 +470,18 @@ class MelFrontEnd:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
             json.dump({"db_max": self.db_max, "config": asdict(self.cfg)}, f, indent=2)
-
+            
     @classmethod
     def load(cls, path, cfg: Config, device="cpu") -> "MelFrontEnd":
         with open(path) as f:
-            return cls(cfg, db_max=json.load(f)["db_max"], device=device)
+            saved = json.load(f)
+        # files saved before a setting existed used that setting's default
+        defaults = {f.name: f.default for f in fields(Config)}
+        keys = ("sample_rate", "n_fft", "hop_length", "n_mels", "f_min", "f_max")
+        diff = {k: (saved["config"].get(k, defaults[k]), getattr(cfg, k)) for k in keys
+                if saved["config"].get(k, defaults[k]) != getattr(cfg, k)}
+        assert not diff, f"{path} was saved with different front-end settings (saved, current): {diff}"
+        return cls(cfg, db_max=saved["db_max"], device=device)
 
 
 class LinearFrontEnd(MelFrontEnd):
