@@ -12,4 +12,12 @@ Comparing diffusion pipelines for synthetic audio generation, as a testbed for d
 | `notebooks/path_c_linear_diffusion.ipynb` | Path C: Path A's model on linear-frequency spectrograms. |
 | `notebooks/evaluate_paths.ipynb` | Scores every path against held-out real audio in one space: decoded audio, PANNs and CLAP embeddings, representation ceilings, calibrated Frechet and MMD. |
 
+## Ocean sounds (grouper / vessel, 10 kHz)
+
+| Notebook | What it does |
+|---|---|
+| `notebooks/ocean_path_a.ipynb` | Loads and cleans the ocean dataset (duplicates, recording groups, folds), then trains Path A at 128 mel bands and saves samples. |
+| `notebooks/ocean_frontend_probe.ipynb` | Tests alternative mel front ends with a small classifier on real clips, a pre-registered decision rule and a 2.5-5 kHz negative control. Result: keep the current front end. |
+| `notebooks/ocean_evaluate.ipynb` | Scores the ocean Path A samples against the validation fold: class fidelity under a classifier trained on real clips, calibrated Frechet/MMD overall and per class (in-domain embedder, PANNs, CLAP), ceilings, learnability on validation clips, and a memorization check. |
+
 Shared code: `common.py` (config, data, front ends, training loop, sampler) and `eval_metrics.py` (metrics).
