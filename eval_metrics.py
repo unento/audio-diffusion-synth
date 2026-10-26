@@ -463,6 +463,13 @@ def calibrated_report(
 
     rng = np.random.default_rng(seed)
     sub_rngs = {k: np.random.default_rng([seed, zlib.crc32(k.encode())]) for k in candidates}
+    cap_rng = np.random.default_rng([seed, 1])
+    # Every comparison must use the same number of clips. A group split can make B
+    # larger than the smallest non-aligned candidate set; then B is subsampled to that
+    # size, so the floor and every candidate are compared at exactly the same size.
+    # (Never triggers when every candidate has at least as many clips as B.)
+    free = [len(c) for k, c in candidates.items() if k not in aligned]
+    cap = min(free) if free else None
     floor_runs: List[Dict[str, float]] = []
     cand_runs: Dict[str, List[Dict[str, float]]] = {k: [] for k in candidates}
 
@@ -471,6 +478,8 @@ def calibrated_report(
         in_a[rng.permutation(n_groups)[: n_groups // 2]] = True
         idx_a = np.flatnonzero(in_a[g])
         idx_b = np.flatnonzero(~in_a[g])
+        if cap is not None and len(idx_b) > cap:
+            idx_b = np.sort(cap_rng.choice(idx_b, cap, replace=False))
         A, B = real[idx_a], real[idx_b]
         floor_runs.append(metrics_fn(A, B))
         for name, C in candidates.items():
