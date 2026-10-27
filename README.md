@@ -12,6 +12,8 @@ Comparing diffusion pipelines for synthetic audio generation, as a testbed for d
 | `notebooks/path_c_linear_diffusion.ipynb` | Path C: Path A's model on linear-frequency spectrograms. |
 | `notebooks/evaluate_paths.ipynb` | Scores every path against held-out real audio in one space: decoded audio, PANNs and CLAP embeddings, representation ceilings, calibrated Frechet and MMD. |
 | `notebooks/tstr_pilot_esc50.ipynb` | Pre-registered TSTR pilot gate: one frozen classifier trained on A-128, B raw and B latent synthetic sets and on matched real data, tested on fold 5. Decides whether the full metric-vs-utility study can run. |
+| `notebooks/tstr_sample_sets.ipynb` | Samples the study's new synthetic sets: A-64, A-128 and C at EMA 5k/10k and guidance 1.0/3.0 (9 new sets). Resumable. |
+| `notebooks/tstr_study_esc50.ipynb` | The full study: 15 synthetic sets, calibrated Frechet (CLAP, PANNs) against fold 4, TSTR on fold 5 with the pilot's frozen recipe, Spearman correlations with path-bootstrap intervals, within-factor agreement. Resumable. |
 
 ## Ocean sounds (grouper / vessel, 10 kHz)
 
@@ -21,4 +23,4 @@ Comparing diffusion pipelines for synthetic audio generation, as a testbed for d
 | `notebooks/ocean_frontend_probe.ipynb` | Tests alternative mel front ends with a small classifier on real clips, a pre-registered decision rule and a 2.5-5 kHz negative control. Result: keep the current front end. |
 | `notebooks/ocean_evaluate.ipynb` | Scores the ocean Path A samples against the validation fold: class fidelity under a classifier trained on real clips, calibrated Frechet/MMD overall and per class (in-domain embedder, PANNs, CLAP), ceilings, learnability on validation clips, and a memorization check. |
 
-Shared code: `common.py` (config, data, front ends, training loop, sampler) and `eval_metrics.py` (metrics).
+Shared code: `common.py` (config, data, front ends, training loop, sampler), `eval_metrics.py` (metrics) and `tstr.py` (the TSTR classifier and its training loop).
