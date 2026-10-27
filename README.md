@@ -11,6 +11,7 @@ Comparing diffusion pipelines for synthetic audio generation, as a testbed for d
 | `notebooks/path_b_latent_diffusion.ipynb` | Path B (time-domain latent): 1D UNet on DAC's continuous latent reduced with PCA, decoded by DAC. Replaces the token-embedding version. |
 | `notebooks/path_c_linear_diffusion.ipynb` | Path C: Path A's model on linear-frequency spectrograms. |
 | `notebooks/evaluate_paths.ipynb` | Scores every path against held-out real audio in one space: decoded audio, PANNs and CLAP embeddings, representation ceilings, calibrated Frechet and MMD. |
+| `notebooks/tstr_pilot_esc50.ipynb` | Pre-registered TSTR pilot gate: one frozen classifier trained on A-128, B raw and B latent synthetic sets and on matched real data, tested on fold 5. Decides whether the full metric-vs-utility study can run. |
 
 ## Ocean sounds (grouper / vessel, 10 kHz)
 
