@@ -141,3 +141,32 @@ def grouped_bootstrap(stat: Callable[[np.ndarray], float], groups: Sequence, n_b
     rng = np.random.default_rng(seed)
     vals = [stat(np.concatenate([members[j] for j in rng.integers(len(ug), size=len(ug))])) for _ in range(n_boot)]
     return tuple(float(v) for v in np.percentile(vals, q))
+
+
+def subset_split(split: dict, idx) -> dict:
+    """The clips of a split at positions idx, with every per-clip field kept."""
+    idx = torch.as_tensor(np.asarray(idx), dtype=torch.long)
+    out = {"waveforms": split["waveforms"][idx], "labels": split["labels"][idx],
+           "folds": split["folds"][idx], "class_names": split["class_names"]}
+    for k in ("groups", "files"):
+        if k in split:
+            out[k] = [split[k][i] for i in idx.tolist()]
+    return out
+
+
+def scarce_indices(labels, n_per_class: int, seed: int = 0) -> np.ndarray:
+    """Positions of n_per_class clips per class, nested across budgets.
+
+    Each class gets one fixed random order (from seed); a budget takes the first
+    n_per_class clips of it. So the 16-clip set is inside the 64-clip set, which is
+    inside the 256-clip set: a larger budget only adds clips, and a generator trained
+    on budget N saw exactly the real clips a classifier at budget N gets.
+    """
+    labels = np.asarray(labels)
+    rng = np.random.default_rng(seed)
+    out = []
+    for c in np.unique(labels):
+        order = rng.permutation(np.flatnonzero(labels == c))
+        assert len(order) >= n_per_class, f"class {c} has only {len(order)} clips"
+        out.append(order[:n_per_class])
+    return np.sort(np.concatenate(out))
